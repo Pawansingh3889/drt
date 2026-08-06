@@ -9,8 +9,24 @@ Provides pluggable storage for cursor/watermark values:
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
+
+# How many times a conditional watermark write may lose its race before giving
+# up. Contention here is two syncs finishing at the same moment, not sustained
+# load, so a handful of retries covers it; anything beyond that is a signal
+# worth surfacing rather than absorbing.
+_MAX_WRITE_ATTEMPTS = 5
+
+
+class WatermarkContentionError(RuntimeError):
+    """A conditional watermark write kept losing its race and was abandoned.
+
+    Raised rather than swallowed: a watermark that silently fails to persist
+    sends the next run back to a stale cursor, which is the failure this
+    conditional write exists to prevent (#919).
+    """
 
 
 class WatermarkStorage(Protocol):
@@ -81,6 +97,24 @@ def _gcs_client() -> Any:
     return Client()
 
 
+def _gcs_precondition_errors() -> tuple[type[Exception], type[Exception]]:
+    """Lazy ``(NotFound, PreconditionFailed)``, imported only when needed.
+
+    Same reasoning as ``_gcs_client``: these live in ``google-api-core``, which
+    only arrives with an extra, so importing them at module scope would make
+    ``[gcs]`` a hard dependency of every install. Kept as a helper rather than
+    inlined so the conditional-write path stays testable without one.
+    """
+    try:
+        from google.api_core.exceptions import (  # type: ignore[import-untyped]
+            NotFound,
+            PreconditionFailed,
+        )
+    except ImportError as e:
+        raise ImportError("GCS watermark storage requires: pip install drt-core[gcs]") from e
+    return NotFound, PreconditionFailed
+
+
 class GCSWatermarkStorage:
     """Google Cloud Storage watermark backend.
 
@@ -105,25 +139,86 @@ class GCSWatermarkStorage:
         except (json.JSONDecodeError, ValueError):
             return {}
 
+    def _read_for_update(self, blob: Any) -> tuple[dict[str, str], int]:
+        """Load the watermarks along with the generation they were read at.
+
+        Separate from ``_load`` because only the write path needs the
+        generation: ``get`` is a plain read and has nothing to be conditional
+        about. A generation of ``0`` means the object does not exist yet, which
+        is also GCS's precondition value for "only if still absent".
+        """
+        not_found, _ = _gcs_precondition_errors()
+
+        try:
+            blob.reload()
+        except not_found:
+            return {}, 0
+        generation = int(blob.generation)
+        try:
+            # Pinned to the generation just read, so the bytes and the
+            # precondition token cannot come from different versions.
+            raw = blob.download_as_text(if_generation_match=generation)
+        except not_found:
+            return {}, 0
+        try:
+            data: dict[str, str] = json.loads(raw)
+            return data, generation
+        except (json.JSONDecodeError, ValueError):
+            return {}, generation
+
+    def _write(self, mutate: Callable[[dict[str, str]], bool]) -> None:
+        """Apply ``mutate`` to the stored watermarks under a generation precondition.
+
+        The whole blob is one object, so a read-modify-write cycle without a
+        precondition loses any update that landed in between: two syncs
+        finishing together would each write their own key over a base that no
+        longer reflected the other, and the later upload would silently discard
+        the earlier one (#919). ``if_generation_match`` turns that lost update
+        into a 412, which is retried against freshly read state.
+
+        ``mutate`` returns whether it changed anything, so a no-op skips the
+        upload entirely.
+        """
+        _, precondition_failed = _gcs_precondition_errors()
+
+        for _ in range(_MAX_WRITE_ATTEMPTS):
+            blob = self._blob()
+            data, generation = self._read_for_update(blob)
+            if not mutate(data):
+                return
+            try:
+                blob.upload_from_string(
+                    json.dumps(data, indent=2),
+                    content_type="application/json",
+                    if_generation_match=generation,
+                )
+            except precondition_failed:
+                continue  # someone else wrote first; re-read and reapply
+            return
+
+        raise WatermarkContentionError(
+            f"gs://{self._bucket_name}/{self._key} was modified by another writer "
+            f"on every one of {_MAX_WRITE_ATTEMPTS} attempts, so the watermark was "
+            f"not saved. Retry the sync; if this repeats, the same watermark blob is "
+            f"probably shared by more concurrent syncs than it can serialize."
+        )
+
     def get(self, sync_name: str) -> str | None:
         return self._load().get(sync_name)
 
     def save(self, sync_name: str, value: str) -> None:
-        data = self._load()
-        data[sync_name] = value
-        self._blob().upload_from_string(
-            json.dumps(data, indent=2),
-            content_type="application/json",
-        )
+        def apply(data: dict[str, str]) -> bool:
+            data[sync_name] = value
+            return True
+
+        self._write(apply)
 
     def delete(self, sync_name: str) -> None:
-        data = self._load()
-        if data.pop(sync_name, None) is None:
-            return  # nothing stored — skip the upload round trip entirely
-        self._blob().upload_from_string(
-            json.dumps(data, indent=2),
-            content_type="application/json",
-        )
+        def apply(data: dict[str, str]) -> bool:
+            # nothing stored: skip the upload round trip entirely
+            return data.pop(sync_name, None) is not None
+
+        self._write(apply)
 
 
 def _bq_client(project: str | None = None) -> Any:
