@@ -146,6 +146,11 @@ class GCSWatermarkStorage:
         generation: ``get`` is a plain read and has nothing to be conditional
         about. A generation of ``0`` means the object does not exist yet, which
         is also GCS's precondition value for "only if still absent".
+
+        Raises the GCS precondition error if a competing writer lands between
+        the ``reload()`` and the pinned download: the object still exists, just
+        at a newer generation, so that is a 412 and not a 404. Callers must
+        treat it as contention and retry, which is what ``_write`` does.
         """
         not_found, _ = _gcs_precondition_errors()
 
@@ -178,12 +183,20 @@ class GCSWatermarkStorage:
 
         ``mutate`` returns whether it changed anything, so a no-op skips the
         upload entirely.
+
+        The read is inside the retry boundary, not before it: ``_read_for_update``
+        is itself two round trips, and a writer landing between them fails the
+        pinned download's precondition. That is contention like any other, so it
+        costs an attempt and re-reads rather than escaping as a raw 412.
         """
         _, precondition_failed = _gcs_precondition_errors()
 
         for _ in range(_MAX_WRITE_ATTEMPTS):
             blob = self._blob()
-            data, generation = self._read_for_update(blob)
+            try:
+                data, generation = self._read_for_update(blob)
+            except precondition_failed:
+                continue  # someone else wrote mid-read; re-read from scratch
             if not mutate(data):
                 return
             try:

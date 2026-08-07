@@ -124,6 +124,9 @@ class _FakeGCSObject:
         # Fires immediately before a write is applied, to land a competing
         # writer at exactly the point a real race would occur.
         self.before_upload: Any = None
+        # Fires between reload() and the pinned download, the other point a
+        # competing writer can land: the read is two round trips, not one.
+        self.before_download: Any = None
 
     def land_competing_write(self, content: str) -> None:
         self.content = content
@@ -144,6 +147,8 @@ class _FakeBlob:
         self.generation = self._store.generation
 
     def download_as_text(self, if_generation_match: int | None = None) -> str:
+        if self._store.before_download is not None:
+            self._store.before_download()
         if self._store.generation == 0:
             raise _NotFound("no such object")
         if if_generation_match is not None and if_generation_match != self._store.generation:
@@ -225,6 +230,49 @@ class TestGCSWatermarkConcurrency:
             self._storage(store).delete("sync_a")
 
         assert json.loads(store.content or "") == {"sync_b": "new_b"}
+
+    def test_writer_landing_mid_read_is_retried_not_raised(self) -> None:
+        """The read is two round trips, and the gap between them is racy.
+
+        ``reload()`` reads the generation; the download is pinned to it. A
+        competing writer landing in between fails that pin with a 412: the
+        object still exists, so it is not the 404 the read guards against.
+        Unhandled, it would escape ``save()`` as a raw ``PreconditionFailed``,
+        which is the outcome ``WatermarkContentionError`` exists to prevent.
+        """
+        store = _FakeGCSObject(json.dumps({"sync_a": "old_a"}))
+
+        def land_sync_b() -> None:
+            store.before_download = None  # once only
+            store.land_competing_write(json.dumps({"sync_a": "old_a", "sync_b": "b_value"}))
+
+        store.before_download = land_sync_b
+
+        with self._patch_errors():
+            self._storage(store).save("sync_a", "new_a")
+
+        assert json.loads(store.content or "") == {"sync_a": "new_a", "sync_b": "b_value"}
+
+    def test_sustained_mid_read_contention_fails_loudly(self) -> None:
+        """Losing every read must fail the same way as losing every write."""
+        import pytest
+
+        from drt.state.watermark import _MAX_WRITE_ATTEMPTS, WatermarkContentionError
+
+        store = _FakeGCSObject(json.dumps({"sync_a": "old"}))
+        reads = 0
+
+        def always_lose() -> None:
+            nonlocal reads
+            reads += 1
+            store.land_competing_write(json.dumps({"sync_a": f"other_{reads}"}))
+
+        store.before_download = always_lose
+
+        with self._patch_errors(), pytest.raises(WatermarkContentionError, match="not saved"):
+            self._storage(store).save("sync_a", "mine")
+
+        assert reads == _MAX_WRITE_ATTEMPTS
 
     def test_delete_of_unknown_sync_writes_nothing(self) -> None:
         store = _FakeGCSObject(json.dumps({"sync_a": "a_value"}))
