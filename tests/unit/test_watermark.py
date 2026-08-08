@@ -274,6 +274,47 @@ class TestGCSWatermarkConcurrency:
 
         assert reads == _MAX_WRITE_ATTEMPTS
 
+    def test_object_deleted_mid_read_starts_from_absent(self) -> None:
+        """A delete in the read gap is a 404, not a 412, and is not contention.
+
+        ``reload()`` succeeds and then the object goes away before the pinned
+        download runs. There is no competing generation to lose to here, so the
+        right answer is to treat the object as absent and write it fresh rather
+        than to burn an attempt retrying against something that is gone.
+        """
+        store = _FakeGCSObject(json.dumps({"sync_a": "old_a", "sync_b": "old_b"}))
+
+        def delete_the_object() -> None:
+            store.before_download = None  # once only
+            store.generation = 0
+            store.content = None
+
+        store.before_download = delete_the_object
+
+        with self._patch_errors():
+            self._storage(store).save("sync_a", "new_a")
+
+        assert json.loads(store.content or "") == {"sync_a": "new_a"}
+        # Generation 1, not 2: the write went out under if_generation_match=0
+        # ("only if still absent"), so this is a fresh object's first version.
+        assert store.generation == 1
+
+    def test_unparseable_object_is_replaced_at_its_own_generation(self) -> None:
+        """Unreadable contents are given up on, but the generation is not.
+
+        Returning ``0`` instead of the generation just read would pin the write
+        to "only if still absent" against an object that plainly exists, so
+        every attempt would 412 and a self-healing case would raise
+        ``WatermarkContentionError`` instead of overwriting the bad object.
+        """
+        store = _FakeGCSObject("{not json")
+
+        with self._patch_errors():
+            self._storage(store).save("sync_a", "new_a")
+
+        assert json.loads(store.content or "") == {"sync_a": "new_a"}
+        assert store.generation == 2  # pinned to the generation it read, and passed
+
     def test_delete_of_unknown_sync_writes_nothing(self) -> None:
         store = _FakeGCSObject(json.dumps({"sync_a": "a_value"}))
         with self._patch_errors():
