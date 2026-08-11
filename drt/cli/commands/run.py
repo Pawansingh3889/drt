@@ -63,7 +63,12 @@ from drt.cli._helpers import (
     get_watermark_storage,
     resolve_profile_name,
 )
-from drt.cli._selection import SelectionError, complete_selector, select_syncs
+from drt.cli._selection import (
+    SelectionError,
+    complete_selector,
+    is_state_only_select,
+    select_syncs,
+)
 from drt.cli.output import (
     console,
     print_dry_run_summary,
@@ -463,7 +468,8 @@ def run(
         "-s",
         help=(
             "Select syncs: name or glob (users_*), tag:<pattern>, "
-            'destination:<type>, or "*" / "all". Repeat to union.'
+            "destination:<type>, state:modified/state:new, "
+            'or "*" / "all". Repeat to union.'
         ),
         autocompletion=complete_selector,
     ),
@@ -472,6 +478,14 @@ def run(
         "--exclude",
         help="Subtract syncs from the selection (same grammar as --select). Repeatable.",
         autocompletion=complete_selector,
+    ),
+    state: Path | None = typer.Option(
+        None,
+        "--state",
+        help=(
+            "Baseline manifest path for state:modified/state:new selectors "
+            "(for example, a prior `drt docs generate --format json` CI artifact)."
+        ),
     ),
     failed_only: bool = typer.Option(
         False,
@@ -569,6 +583,7 @@ def run(
       drt run --select 'users_*' --exclude users_backfill
       drt run --select tag:crm --select tag:ads --threads 4
       drt run --select destination:hubspot
+      drt run --select state:modified --state ci-baseline/manifest.json --dry-run --diff
       drt run --failed
       drt run --dry-run --diff
     """
@@ -632,11 +647,26 @@ def run(
         raise typer.Exit()
 
     try:
-        syncs = select_syncs(syncs, select, exclude)
+        if state is not None:
+            from drt.cli._state_selection import load_state_diff
+
+            state_diff = load_state_diff(state, syncs, Path("."))
+            syncs = select_syncs(syncs, select, exclude, state_diff=state_diff)
+        else:
+            syncs = select_syncs(syncs, select, exclude)
     except SelectionError as e:
         print_error(str(e))
         raise typer.Exit(1)
     if not syncs:
+        if is_state_only_select(select):
+            # Nothing changed relative to the baseline — the normal, healthy
+            # outcome for a CI job on a PR that touched no sync definitions,
+            # not an error the way a dud tag:/bare-name selector would be.
+            if not json_mode:
+                console.print(
+                    "[dim]No syncs changed relative to the baseline — nothing to run.[/dim]"
+                )
+            raise typer.Exit()
         print_error("Selection matched no syncs (after --exclude).")
         raise typer.Exit(1)
 
