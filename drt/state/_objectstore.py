@@ -14,11 +14,12 @@ import random
 import sys
 import threading
 import time
+from collections.abc import Collection, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol, runtime_checkable
 
-from drt.state.dlq import DeadLetter
+from drt.state.dlq import DeadLetter, decode_dead_letter_line
 from drt.state.errors import StateContentionError
 from drt.state.history import HistoryEntry
 from drt.state.manager import SyncState
@@ -317,7 +318,7 @@ class ObjectStoreDlqBackend(_ObjectStoreBase):
             if not raw.strip():
                 continue
             try:
-                entries.append(DeadLetter(**json.loads(raw)))
+                entries.append(decode_dead_letter_line(raw))
             except (json.JSONDecodeError, TypeError):
                 continue
         return entries
@@ -390,6 +391,45 @@ class ObjectStoreDlqBackend(_ObjectStoreBase):
 
     def clear(self, sync_name: str) -> None:
         self.replace(sync_name, [])
+
+    def reconcile(
+        self,
+        sync_name: str,
+        *,
+        remove_ids: Collection[str] = (),
+        updates: Mapping[str, DeadLetter] | None = None,
+    ) -> list[DeadLetter]:
+        """Remove/update entries by identity against a fresh read (#955).
+
+        Each attempt re-reads the object under a fresh generation/ETag
+        rather than retrying the same stale content ``replace()`` would —
+        that's what lets a concurrent ``append()`` (itself already
+        precondition-safe) survive a racing ``drt retry`` instead of being
+        silently overwritten.
+        """
+        updates = updates or {}
+        remove_ids = set(remove_ids)
+        key = self._dlq_key(sync_name)
+        with self._lock:
+            for attempt in range(1, self.MAX_WRITE_ATTEMPTS + 1):
+                try:
+                    body, token = self._client.read_for_update(key)
+                    current = self._decode(body)
+                    result = [
+                        updates.get(entry.id, entry)
+                        for entry in current
+                        if entry.id not in remove_ids
+                    ]
+                    self._client.write_if(key, self._encode(result), token)
+                    return result
+                except ObjectPreconditionError:
+                    if attempt == self.MAX_WRITE_ATTEMPTS:
+                        raise ObjectPreconditionError(
+                            f"DLQ reconcile for '{sync_name}' exhausted "
+                            f"{self.MAX_WRITE_ATTEMPTS} attempts"
+                        )
+                    self._backoff(attempt)
+        return []  # pragma: no cover
 
     def read(self, sync_name: str) -> list[DeadLetter]:
         with self._lock:

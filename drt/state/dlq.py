@@ -19,8 +19,11 @@ is a privacy decision the operator makes explicitly, not a default.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
+import uuid
+from collections.abc import Collection, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +48,48 @@ class DeadLetter:
     # See drt._identifiers. None on entries written before this field existed;
     # the JSONL reader tolerates the missing key via the dataclass default.
     sync_run_id: str | None = None
+    # Stable identity (#955) — assigned once at creation and preserved by
+    # `drt retry` across attempts (a retried-and-failed-again entry keeps its
+    # id; only `attempts`/`timestamp`/`error_message` change), so `reconcile()`
+    # below can remove/update entries by identity against a *fresh* read
+    # instead of overwriting the whole queue from a snapshot that may already
+    # be stale.
+    #
+    # This default only fires for a freshly-constructed entry that has never
+    # touched JSON (e.g. `engine/sync.py`'s per-failure `DeadLetter(...)`) —
+    # its id is assigned once, in Python, before the object is ever
+    # serialized. It must NOT fire when *decoding* a legacy JSONL line that
+    # predates this field: `replay_dead_letters()` reads the queue twice per
+    # invocation (once to decide what to retry, again inside `reconcile()`
+    # to compute the write), and two independent `DeadLetter(**json.loads(
+    # line))` calls on the *same unchanged line* would each trigger this
+    # factory fresh — producing two different random ids for one entry, so
+    # every legacy entry's remove/update would silently never match
+    # (caught in review, #955). `decode_dead_letter_line()` below is the
+    # actual JSONL entry point and handles that case with a content hash
+    # instead — deterministic for the same bytes, so two reads of the same
+    # untouched line agree. Bypassing that function and constructing
+    # directly from a legacy dict (as tests occasionally do to simulate a
+    # pre-#955 file) is the only path that still exercises this default on
+    # already-persisted data — a reminder to route JSONL reads through the
+    # decoder, not this constructor default.
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+
+def decode_dead_letter_line(raw_line: str) -> DeadLetter:
+    """Parse one DLQ JSONL line into a ``DeadLetter``.
+
+    Entries written before ``id`` existed get a deterministic id — the
+    SHA-256 of the literal line content — rather than the dataclass
+    default's random one, so repeated reads of the same unchanged line
+    (``replay_dead_letters()`` reads the queue twice per invocation) agree
+    on identity instead of producing entries ``reconcile()`` can never
+    match (#955).
+    """
+    data = json.loads(raw_line)
+    if "id" not in data:
+        data["id"] = hashlib.sha256(raw_line.strip().encode()).hexdigest()
+    return DeadLetter(**data)
 
 
 @runtime_checkable
@@ -67,6 +112,24 @@ class DlqBackend(Protocol):
     def read(self, sync_name: str) -> list[DeadLetter]: ...
     def depth(self, sync_name: str) -> int: ...
     def all_depths(self) -> dict[str, int]: ...
+
+    def reconcile(
+        self,
+        sync_name: str,
+        *,
+        remove_ids: Collection[str] = (),
+        updates: Mapping[str, DeadLetter] | None = None,
+    ) -> list[DeadLetter]:
+        """Remove/update entries by identity against a *fresh* read (#955).
+
+        Unlike ``replace()``, which overwrites the whole queue with whatever
+        the caller passes, ``reconcile()`` re-reads current state itself and
+        only touches entries named in ``remove_ids``/``updates`` — entries
+        the caller never saw (e.g. a concurrent ``drt run`` append that
+        landed after the caller's own ``read()``) are left alone rather than
+        silently dropped. Returns the resulting full entry list.
+        """
+        ...
 
 
 class LocalDlqStore:
@@ -130,8 +193,12 @@ class LocalDlqStore:
     def replace(self, sync_name: str, entries: list[DeadLetter]) -> None:
         """Overwrite the queue with ``entries`` (empty list removes the file).
 
-        ``drt retry`` calls this to drop successfully-replayed records and
-        write back the ones that failed again (with bumped ``attempts``).
+        Wholesale — ``entries`` fully replaces whatever is on disk, including
+        anything a concurrent writer appended since this call's caller last
+        read the queue (#955). ``drt retry`` uses ``reconcile()`` instead,
+        which re-reads fresh state and touches only named entries; this
+        method still backs ``clear()`` (discard everything, intentionally)
+        and stays available for callers that genuinely want a full overwrite.
         """
         with self._lock:
             path = self._path(sync_name)
@@ -142,21 +209,79 @@ class LocalDlqStore:
             path.write_text("\n".join(json.dumps(asdict(e)) for e in entries) + "\n")
 
     def clear(self, sync_name: str) -> None:
-        """Remove the queue file for ``sync_name`` if it exists."""
+        """Remove the queue file for ``sync_name`` if it exists.
+
+        Wholesale, like ``replace([])`` which backs it — a concurrent append
+        racing this call can still be dropped. That's the documented
+        contract ("discard the queue without replaying, records are
+        unrecoverable" per the CLI's own ``--clear`` help text), not an
+        oversight left over from ``reconcile()`` hardening the retry path.
+        """
         self.replace(sync_name, [])
 
     # -- reads --------------------------------------------------------------
 
-    def read(self, sync_name: str) -> list[DeadLetter]:
-        """Return every dead-letter entry for ``sync_name`` (corrupt lines skipped)."""
+    def _read_entries(self, sync_name: str) -> list[DeadLetter]:
         out: list[DeadLetter] = []
         for line in self._read_raw(self._path(sync_name)):
             try:
-                out.append(DeadLetter(**json.loads(line)))
+                out.append(decode_dead_letter_line(line))
             except (json.JSONDecodeError, TypeError):
                 # A single malformed line should not abort an entire retry.
                 continue
         return out
+
+    def read(self, sync_name: str) -> list[DeadLetter]:
+        """Return every dead-letter entry for ``sync_name`` (corrupt lines skipped)."""
+        return self._read_entries(sync_name)
+
+    def reconcile(
+        self,
+        sync_name: str,
+        *,
+        remove_ids: Collection[str] = (),
+        updates: Mapping[str, DeadLetter] | None = None,
+    ) -> list[DeadLetter]:
+        """Remove/update entries by identity against a fresh read (#955).
+
+        See the ``DlqBackend`` Protocol docstring for the "why" — the short
+        version is this is what ``drt retry`` uses instead of ``replace()``
+        so a concurrent append isn't silently overwritten.
+
+        ``self._lock`` is process-local (same caveat as the class docstring
+        above), and this class has no OS-level file lock or conditional
+        write — unlike ``ObjectStoreDlqBackend.reconcile()``, which is
+        genuinely safe against a concurrent writer because generation/ETag
+        preconditioning catches a stale write and forces a retry against
+        fresh state. Here, a separate ``drt run`` **process** appending
+        between this method's read and its write still loses that append
+        exactly as ``replace()`` did (caught in review, #962) — this class
+        was never cross-process-safe (see the docstring above) and this
+        method does not change that. What it *does* fix, on local too: the
+        legacy bug of computing a result from a stale in-memory snapshot
+        (``untouched + remaining``) rather than from a fresh read, and
+        reconciling by identity rather than position — both matter the
+        moment real file locking lands, since a wholesale-overwrite
+        operation could never be made cross-process-safe no matter how it's
+        locked. Real cross-process safety needs OS-level file locking,
+        which no local state store has today; tracked as a follow-up
+        (#963) covering ``LocalStateManager``/``LocalHistoryManager`` too,
+        not just this class.
+        """
+        updates = updates or {}
+        remove_ids = set(remove_ids)
+        with self._lock:
+            path = self._path(sync_name)
+            current = self._read_entries(sync_name)
+            result = [
+                updates.get(entry.id, entry) for entry in current if entry.id not in remove_ids
+            ]
+            if not result:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("\n".join(json.dumps(asdict(e)) for e in result) + "\n")
+            return result
 
     def depth(self, sync_name: str) -> int:
         """Return the number of entries queued for ``sync_name``."""
