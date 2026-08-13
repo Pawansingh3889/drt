@@ -21,12 +21,12 @@ Example sync YAML:
 
 from __future__ import annotations
 
-import os
 import re
 from typing import Any
 
 import httpx
 
+from drt.config.credentials import resolve_env
 from drt.config.models import (
     DestinationConfig,
     SyncOptions,
@@ -56,13 +56,11 @@ class TwilioDestination:
         sync_options: SyncOptions,
     ) -> SyncResult:
         assert isinstance(config, TwilioDestinationConfig)
+        if not records:
+            return SyncResult()
 
-        account_sid = config.account_sid or (
-            os.environ.get(config.account_sid_env) if config.account_sid_env else None
-        )
-        auth_token = config.auth_token or (
-            os.environ.get(config.auth_token_env) if config.auth_token_env else None
-        )
+        account_sid = resolve_env(config.account_sid, config.account_sid_env)
+        auth_token = resolve_env(config.auth_token, config.auth_token_env)
 
         if not account_sid or not auth_token:
             raise ValueError(

@@ -9,11 +9,11 @@ For each record:
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 import httpx
 
+from drt.config.credentials import resolve_env
 from drt.config.models import DestinationConfig, JiraDestinationConfig, RetryConfig, SyncOptions
 from drt.destinations.base import SyncResult
 from drt.destinations.rate_limiter import RateLimiter, resolve_rate_limiter
@@ -34,6 +34,7 @@ class JiraDestination:
         *,
         client: httpx.Client,
         config: JiraDestinationConfig,
+        base_url: str,
         auth: httpx.BasicAuth,
         retry_config: RetryConfig,
     ) -> None:
@@ -52,7 +53,7 @@ class JiraDestination:
                 "description": _to_adf(description),
             }
         }
-        url = f"{_base_url(config)}/rest/api/3/issue"
+        url = f"{base_url}/rest/api/3/issue"
 
         def do_post() -> httpx.Response:
             response = client.post(url, json=payload, auth=auth)
@@ -68,6 +69,7 @@ class JiraDestination:
         *,
         client: httpx.Client,
         config: JiraDestinationConfig,
+        base_url: str,
         auth: httpx.BasicAuth,
         retry_config: RetryConfig,
     ) -> None:
@@ -81,7 +83,7 @@ class JiraDestination:
                 "description": _to_adf(description),
             }
         }
-        url = f"{_base_url(config)}/rest/api/3/issue/{issue_id}"
+        url = f"{base_url}/rest/api/3/issue/{issue_id}"
 
         def do_put() -> httpx.Response:
             response = client.put(url, json=payload, auth=auth)
@@ -97,16 +99,19 @@ class JiraDestination:
         sync_options: SyncOptions,
     ) -> SyncResult:
         assert isinstance(config, JiraDestinationConfig)
+        if not records:
+            return SyncResult()
 
-        base_url = os.environ.get(config.base_url_env)
-        email = os.environ.get(config.email_env)
-        token = os.environ.get(config.token_env)
+        base_url = resolve_env(None, config.base_url_env)
+        email = resolve_env(None, config.email_env)
+        token = resolve_env(None, config.token_env)
         if not base_url:
             raise ValueError(f"Jira destination: env var '{config.base_url_env}' is required.")
         if not email:
             raise ValueError(f"Jira destination: env var '{config.email_env}' is required.")
         if not token:
             raise ValueError(f"Jira destination: env var '{config.token_env}' is required.")
+        base_url = base_url.rstrip("/")
 
         result = SyncResult()
         rate_limiter = resolve_rate_limiter(config, sync_options, limiter_factory=RateLimiter)
@@ -125,6 +130,7 @@ class JiraDestination:
                             str(issue_id),
                             client=client,
                             config=config,
+                            base_url=base_url,
                             auth=auth,
                             retry_config=retry_config,
                         )
@@ -134,6 +140,7 @@ class JiraDestination:
                             row,
                             client=client,
                             config=config,
+                            base_url=base_url,
                             auth=auth,
                             retry_config=retry_config,
                         )
@@ -168,11 +175,6 @@ class JiraDestination:
         return result
 
 
-def _base_url(config: JiraDestinationConfig) -> str:
-    base_url = os.environ[config.base_url_env].rstrip("/")
-    return base_url
-
-
 def _to_adf(text: str) -> dict[str, Any]:
     """Convert plain text to Atlassian Document Format (ADF)."""
     return {
@@ -185,5 +187,3 @@ def _to_adf(text: str) -> dict[str, Any]:
             }
         ],
     }
-
-
