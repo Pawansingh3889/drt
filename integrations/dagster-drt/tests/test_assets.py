@@ -586,6 +586,91 @@ class TestDagsterDrtResourceRun:
         assert len(state_observers) == 1
         assert state_observers[0]._state_manager is fake_state_store
 
+    def test_run_wires_history_manager(self, tmp_path: Path) -> None:
+        """Regression test (#980): run_sync() must receive history_manager=,
+        or a Dagster-triggered sync's execution history stays empty on every
+        state.backend — run_sync() only appends history when history_manager
+        is passed (engine/sync.py). Found while fixing the identical gap in
+        drt.integrations._runner.run_drt_sync() (#976); out of scope there
+        since it's a separately-versioned package."""
+        project = _setup_project(tmp_path)
+        from dagster_drt.assets import drt_assets
+        from dagster_drt.resource import DagsterDrtResource
+
+        @drt_assets(project_dir=project)
+        def my_syncs(context, drt: DagsterDrtResource):
+            yield from drt.run(context=context)
+
+        ctx = _make_mock_context(my_syncs)
+        resource = DagsterDrtResource(project_dir=str(project))
+
+        with (
+            patch(_P_LOAD_PROJECT) as mock_proj,
+            patch(_P_LOAD_PROFILE),
+            patch(_P_GET_SOURCE),
+            patch(_P_GET_DEST),
+            patch(_P_RUN_SYNC) as mock_run,
+            patch(_P_BUILD_STATE_BUNDLE) as mock_bundle,
+            patch(_P_LOAD_SYNCS) as mock_load_syncs,
+        ):
+            mock_proj.return_value = MagicMock(profile="local")
+            mock_sync = MagicMock()
+            mock_sync.name = "test_sync"
+            mock_sync.sync.dlq = None
+            mock_load_syncs.return_value = [mock_sync]
+            mock_run.return_value = _FakeSyncResult(success=1)
+            fake_history_store = mock_bundle.return_value.history
+
+            list(resource.run(context=ctx))
+
+        assert mock_run.call_args.kwargs["history_manager"] is fake_history_store
+        assert (
+            mock_run.call_args.kwargs["history_retention_days"]
+            is mock_proj.return_value.history.retention_days
+        )
+
+    def test_run_honors_history_disabled(self, tmp_path: Path) -> None:
+        """Regression test: history.enabled: false must actually suppress
+        history persistence, not just default retention. Caught in Codex
+        review on #981: the first version of this fix passed
+        history_manager=bundle.history unconditionally, ignoring the
+        documented opt-out — run_sync() appends history for every non-dry
+        run whenever the manager is non-None, so a project explicitly
+        disabling history would still get it recorded. Matches the CLI's
+        own `history_mgr = state_bundle.history if history_cfg.enabled else
+        None` (drt/cli/commands/run.py:758)."""
+        project = _setup_project(tmp_path)
+        from dagster_drt.assets import drt_assets
+        from dagster_drt.resource import DagsterDrtResource
+
+        @drt_assets(project_dir=project)
+        def my_syncs(context, drt: DagsterDrtResource):
+            yield from drt.run(context=context)
+
+        ctx = _make_mock_context(my_syncs)
+        resource = DagsterDrtResource(project_dir=str(project))
+
+        with (
+            patch(_P_LOAD_PROJECT) as mock_proj,
+            patch(_P_LOAD_PROFILE),
+            patch(_P_GET_SOURCE),
+            patch(_P_GET_DEST),
+            patch(_P_RUN_SYNC) as mock_run,
+            patch(_P_BUILD_STATE_BUNDLE),
+            patch(_P_LOAD_SYNCS) as mock_load_syncs,
+        ):
+            mock_proj.return_value = MagicMock(profile="local")
+            mock_proj.return_value.history.enabled = False
+            mock_sync = MagicMock()
+            mock_sync.name = "test_sync"
+            mock_sync.sync.dlq = None
+            mock_load_syncs.return_value = [mock_sync]
+            mock_run.return_value = _FakeSyncResult(success=1)
+
+            list(resource.run(context=ctx))
+
+        assert mock_run.call_args.kwargs["history_manager"] is None
+
     def test_run_subset_execution(self, tmp_path: Path) -> None:
         """Resource.run() should only execute syncs for selected asset keys."""
         project = _setup_project(tmp_path, TWO_SYNCS)
