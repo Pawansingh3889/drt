@@ -91,6 +91,19 @@ class SyncObserver(Protocol):
         Carries everything an observer needs to persist state, emit a
         final span, or render a summary — without the engine reaching
         for storage itself.
+
+        ``result.dry_run`` is ``True`` when nothing was actually written to
+        the destination — ``new_cursor_value`` still reflects rows *seen*
+        during extraction (dry-run previews still extract), not rows
+        *sent*. Observers that persist durable state (cursors, run
+        counts, watermarks) MUST no-op when ``result.dry_run`` is set;
+        observers that only log or render a summary may use it as they
+        see fit. Deliberately carried on ``result`` rather than as a
+        separate parameter — every existing/custom ``SyncObserver``
+        implementation keeps working unmodified (#978's original fix
+        added a Protocol parameter; Codex review flagged that as a
+        breaking change for any direct, non-``CompositeObserver`` caller,
+        so this reads from ``result`` instead).
         """
         ...
 
@@ -233,6 +246,13 @@ class StatePersistingObserver:
         new_cursor_value: str | None,
         cursor_field: str | None,
     ) -> None:
+        # A dry run extracts (so new_cursor_value reflects rows *seen*) but
+        # never calls destination.load() — persisting here would record a
+        # cursor/run/count for data that was only previewed, never sent,
+        # and the next real run would then skip it (#978).
+        if result.dry_run:
+            return
+
         from drt.state.manager import SyncState
 
         if self._state_manager is not None:

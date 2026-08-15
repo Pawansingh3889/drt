@@ -122,6 +122,27 @@ def test_state_persisting_observer_writes_state_on_sync_completed(tmp_path: Path
     assert saved.records_synced == 10
 
 
+def test_state_persisting_observer_skips_dry_run(tmp_path: Path) -> None:
+    """Regression test (#978): result.dry_run=True must skip state AND
+    watermark persistence entirely, not just the cursor value. A dry run
+    extracts (so new_cursor_value reflects rows seen) but never calls
+    destination.load(), so persisting last_run_at/records_synced/cursor here
+    would record a run that never actually happened — the next real run
+    would then see a misleadingly "already synced" state or skip real data
+    via the cursor. Carried on SyncResult rather than a new on_sync_completed
+    parameter so existing/custom SyncObserver implementations are unaffected
+    (Codex review on the first version of this fix)."""
+    state_mgr = StateManager(tmp_path)
+    wm = MagicMock()
+    obs = StatePersistingObserver(state_mgr, wm)
+    result = SyncResult(success=10, failed=0, dry_run=True)
+
+    obs.on_sync_completed("test_sync", result, "2026-05-24T00:00:00Z", "5", "id")
+
+    assert state_mgr.get_last_sync("test_sync") is None
+    wm.save.assert_not_called()
+
+
 def test_state_persisting_observer_marks_partial(tmp_path: Path) -> None:
     state_mgr = StateManager(tmp_path)
     obs = StatePersistingObserver(state_mgr, None)
