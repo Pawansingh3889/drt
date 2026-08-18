@@ -63,6 +63,13 @@ PASSWORD_ENV = "DRT_SMOKE_SNOWFLAKE_PASSWORD"
 # password users, so the smoke user is a TYPE = SERVICE user with an RSA key.
 KEY_ENV = "DRT_SMOKE_SNOWFLAKE_PRIVATE_KEY"
 
+# Snowflake's SQL access-control error (surfaces as "003001 (42501): ...
+# insufficient privileges..."), confirmed against this exact account when the
+# smoke role lacked OPERATE on the warehouse (#975/#985). Used to distinguish
+# a genuine missing-grant from any other failure in the warehouse-requirement
+# probe below.
+_SNOWFLAKE_INSUFFICIENT_PRIVILEGES = 3001
+
 
 def _require_creds() -> dict[str, str]:
     """Gate on the non-auth vars + at least one auth secret (key preferred)."""
@@ -561,62 +568,166 @@ def test_snowflake_last_change_commit_time_no_change_tracking_required(tmp_path:
     )
 
 
-def test_snowflake_last_change_commit_time_warehouse_requirement(tmp_path: Path) -> None:
-    """#975 research probe: does calling SYSTEM$LAST_CHANGE_COMMIT_TIME require
-    an active virtual warehouse? This is the whole premise for a Tier-2 sensor
-    being "cheap to poll" over Tier 1/Tier 3.
+def test_snowflake_last_change_commit_time_does_not_require_active_warehouse(
+    tmp_path: Path,
+) -> None:
+    """#975 CONFIRMED FINDING, verified live 2026-08-18 against the drt smoke
+    account: ``SYSTEM$LAST_CHANGE_COMMIT_TIME`` is metadata-only and does NOT
+    require an active virtual warehouse. This is a hard assertion, not an
+    informational skip, because the premise it protects -- a Tier-2 sensor
+    being "cheap to poll" -- depends on this staying true. If Snowflake ever
+    changes this function's behaviour, this test must fail loudly, not skip
+    silently (a skip-based version of this test previously reported the
+    finding via ``pytest.skip`` and needed a manual ``-rs`` flag to even be
+    seen -- see #985).
 
-    Opens a session with no ``warehouse=`` specified. If the smoke user has no
-    account-level default, ``CURRENT_WAREHOUSE()`` comes back NULL and the
-    call's success/failure directly answers the question. Skips (does not
-    fail) if this account's smoke user does have a default warehouse --
-    isolating the question then would mean suspending the shared smoke
-    warehouse mid-suite, which is worse than an inconclusive result.
+    Scope note: this is a claim about this one function on this one account,
+    not a general "SYSTEM$ functions are metadata-only" rule (``SHOW
+    STREAMS`` was checked separately, in the trigger matrix research, and
+    happens to also not need one -- that is supporting context, not proof of
+    a class-wide guarantee).
+
+    A prior version of this test tried isolating a no-warehouse *session*
+    (no ``warehouse=`` at connect time) and skipped once it found the smoke
+    user has an account-level default warehouse, making that approach
+    inconclusive. This version instead deliberately SUSPENDs the smoke
+    warehouse itself, calls the function, and asserts the warehouse's own
+    state did not change.
+
+    OPERATE is verified up front via a net-zero round trip (toggle the
+    warehouse's state and immediately toggle it back) regardless of which
+    state it starts in -- not just when it starts RUNNING, which would miss
+    the normal nightly case (a warehouse that's SUSPENDED between smoke
+    runs) and could otherwise leave an auto-resumed warehouse stuck running,
+    with no way to undo it, for a role that never had permission to fix it.
+    Skips (does not fail) if that round trip fails -- OPERATE is not always
+    granted (it was granted specifically to run this verification once; see
+    #985), and its absence says nothing about the finding itself. Once past
+    it, restoring the warehouse to its original state after the real probe
+    is expected to succeed and is *not* swallowed on failure -- a failure
+    there despite the upfront check passing is a genuine surprise worth a
+    loud test failure over a shared resource silently left running and
+    billing.
     """
     creds = _require_creds()
+    wh = creds["DRT_SMOKE_SNOWFLAKE_WAREHOUSE"]
     table = unique_table("DRT_SMOKE_LCC_WH")
     fq = f"{creds['DRT_SMOKE_SNOWFLAKE_DATABASE']}.{creds['DRT_SMOKE_SNOWFLAKE_SCHEMA']}.{table}"
 
-    setup_conn = _connect(creds)
+    def _is_suspended(cur: Any) -> bool:
+        cur.execute(f"SHOW WAREHOUSES LIKE '{wh}'")  # noqa: S608 -- test-only, fixed LIKE pattern from env config
+        columns = [d[0] for d in cur.description]
+        row = dict(zip(columns, cur.fetchone(), strict=True))
+        return str(row["state"]) == "SUSPENDED"
+
+    def _ensure_suspended(cur: Any, should_be_suspended: bool) -> None:
+        """Idempotent: query the *actual* current state and only issue an
+        ALTER if it doesn't already match. Never trust in-memory bookkeeping
+        about which ALTER calls the client thinks succeeded -- Snowflake can
+        apply a statement server-side even if the client-side acknowledgment
+        is lost to a timeout, so "my execute() raised" does not reliably
+        mean "nothing changed" (Codex review round 4, #985). Re-checking the
+        real state before every state-changing decision makes this correct
+        regardless of that ambiguity. Boolean rather than a state-string
+        comparison on purpose: "SUSPENDED" is the only literal this file
+        verifies against a real account -- the non-suspended state's exact
+        string (STARTED? RUNNING?) was never confirmed, so branching on
+        equality against a guessed value would be exactly the kind of
+        unverified assumption this investigation exists to avoid.
+        """
+        if _is_suspended(cur) == should_be_suspended:
+            return
+        cur.execute(f"ALTER WAREHOUSE {wh} {'SUSPEND' if should_be_suspended else 'RESUME'}")
+
+    conn = _connect(creds)
     try:
-        with setup_conn.cursor() as cur:
+        with conn.cursor() as cur:
             cur.execute(f"CREATE TABLE {table} (id INTEGER)")
-    finally:
-        setup_conn.close()
 
-    try:
-        auth: dict[str, object] = {}
-        if os.environ.get(KEY_ENV):
-            from drt.config.credentials import load_snowflake_private_key
+            was_suspended = _is_suspended(cur)
 
-            auth["private_key"] = load_snowflake_private_key(os.environ[KEY_ENV])
-        else:
-            auth["password"] = os.environ[PASSWORD_ENV]
-        no_wh_conn = snowflake_connector.connect(
-            account=creds[ACCOUNT_ENV],
-            user=creds[USER_ENV],
-            database=creds["DRT_SMOKE_SNOWFLAKE_DATABASE"],
-            schema=creds["DRT_SMOKE_SNOWFLAKE_SCHEMA"],
-            **auth,
-        )
-        try:
-            with no_wh_conn.cursor() as cur:
-                cur.execute("SELECT CURRENT_WAREHOUSE()")
-                active_wh = cur.fetchone()[0]
-                if active_wh is not None:
-                    pytest.skip(
-                        f"#975: smoke user has a default warehouse ({active_wh}) -- "
-                        "cannot isolate the no-warehouse case without suspending "
-                        "shared smoke infra; inconclusive from this account."
+            # Verify OPERATE *before* doing anything state-changing, and do
+            # it regardless of the starting state -- checking only when the
+            # warehouse starts RUNNING (an earlier version of this test)
+            # missed the normal nightly case: a warehouse that starts
+            # SUSPENDED never gets this check at all, so if the probe below
+            # triggers an auto-resume, a role without OPERATE would have no
+            # way to undo it (Codex review round 2, #985). A net-zero round
+            # trip (toggle and toggle back) proves the capability both ways
+            # without any lasting side effect, before the real probe runs.
+            # _ensure_suspended re-checks real state before and after every
+            # call, so a lost acknowledgment can't leave this ambiguous.
+            try:
+                _ensure_suspended(cur, not was_suspended)
+                _ensure_suspended(cur, was_suspended)
+            except Exception as exc:
+                # Only a *verified* insufficient-privilege error means "OPERATE
+                # isn't granted" -- errno 3001 is Snowflake's SQL access-control
+                # error, confirmed against this exact account's denial
+                # ("003001 (42501)") when OPERATE was absent. A blanket except
+                # here would misclassify a transient failure (network blip,
+                # timeout) as a missing grant and report a green skip -- worse,
+                # if the first ALTER above already applied, a timeout on the
+                # second one could leave the shared warehouse in the wrong
+                # state while this reports "OPERATE missing" instead of the
+                # real problem (Codex review, second pass, #985). Anything
+                # that isn't the confirmed privilege error propagates.
+                if getattr(exc, "errno", None) != _SNOWFLAKE_INSUFFICIENT_PRIVILEGES:
+                    raise
+                restore_note = ""
+                try:
+                    _ensure_suspended(cur, was_suspended)
+                except Exception as restore_exc:
+                    restore_note = (
+                        f" (restore attempt ALSO failed: {restore_exc} -- "
+                        f"MANUAL CHECK NEEDED for warehouse {wh})"
                     )
+                pytest.skip(
+                    f"#975: smoke role lacks OPERATE on warehouse {wh} ({exc})"
+                    f"{restore_note} -- verified via a net-zero round trip before "
+                    "running the probe; inconclusive from this account. This is "
+                    "expected and intentional -- OPERATE is deliberately not part "
+                    "of the standard smoke provisioning (see "
+                    "tests/integration/dwh/provisioning/snowflake.sql and "
+                    "docs/research/warehouse-trigger-matrix.md's 2026-08-18 "
+                    "addendum), granted only once to produce the finding this "
+                    "test now asserts when it happens to be present."
+                )
+
+            _ensure_suspended(cur, True)
+
+            try:
+                # Deliberately not caught here: an exception at this specific
+                # call *would* be a real finding ("requires an active
+                # warehouse and AUTO_RESUME couldn't/didn't help"), but
+                # without a verified Snowflake error signature to match on,
+                # blanket-catching this risks misclassifying an unrelated
+                # failure (a network blip, an auth hiccup, a genuinely
+                # invalid object) as a confirmed research conclusion (Codex
+                # review round 3, #985) -- better to fail loudly with the
+                # real error than manufacture an unverified finding.
                 cur.execute(f"SELECT SYSTEM$LAST_CHANGE_COMMIT_TIME('{fq}')")
                 val = cur.fetchone()[0]
                 assert val is not None, (
-                    "#975: call with no active warehouse returned NULL/failed silently"
+                    "#975: call while warehouse was suspended returned NULL"
                 )
-        finally:
-            no_wh_conn.close()
+
+                assert _is_suspended(cur), (
+                    "#975 REGRESSION: warehouse is no longer SUSPENDED after "
+                    "SYSTEM$LAST_CHANGE_COMMIT_TIME (it was SUSPENDED before the "
+                    "call) -- Snowflake auto-resumed it, contradicting the "
+                    "2026-08-18 finding that this call is metadata-only. The "
+                    "Tier-2 sensor's cost model needs re-verifying if this fails."
+                )
+            finally:
+                # Not swallowed on failure -- the round trip above already
+                # confirmed OPERATE works both ways, so a failure here now
+                # is a genuine surprise worth a loud test failure demanding
+                # manual intervention, not a silent pass leaving shared
+                # compute running and billing (Codex review round 2, #985).
+                _ensure_suspended(cur, was_suspended)
     finally:
+        conn.close()
         _drop_table(creds, table)
 
 
