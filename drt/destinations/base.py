@@ -82,7 +82,25 @@ class Destination(Protocol):
         config: DestinationConfig,
         sync_options: SyncOptions,
     ) -> SyncResult:
-        """Send a batch of records to the destination."""
+        """Send a batch of records to the destination.
+
+        Row-level failures are recorded in ``SyncResult.errors`` /
+        ``row_errors`` — implementations MUST populate these rather than
+        raise per-row, or the engine loses per-row error attribution
+        entirely.
+
+        Raises:
+            Exception: an unrecoverable, batch-level failure (connection
+                lost, auth rejected, API outage) — never caught by the
+                engine; propagates and aborts the sync. Also raised, by
+                convention (26 of the current SQL/API destinations do this;
+                see ``bigquery.py``'s ``_insert`` for the reference shape),
+                when ``sync_options.on_error == "fail"`` and at least one
+                row failed: the batch's ``row_errors`` are still populated
+                first, then the destination raises to abort the sync rather
+                than silently continuing past a failure the operator asked
+                to be fatal.
+        """
         ...
 
 
@@ -132,7 +150,13 @@ class StagedDestination(Protocol):
         config: DestinationConfig,
         sync_options: SyncOptions,
     ) -> None:
-        """Accumulate records for later upload."""
+        """Accumulate records for later upload.
+
+        Raises:
+            Exception: staging itself failed (e.g. local buffer/disk error).
+                Row-level outcomes aren't known yet at this point — they
+                surface later from ``finalize()``.
+        """
         ...
 
     def finalize(
@@ -140,7 +164,27 @@ class StagedDestination(Protocol):
         config: DestinationConfig,
         sync_options: SyncOptions,
     ) -> SyncResult:
-        """Upload staged file, trigger job, poll for completion."""
+        """Upload staged file, trigger job, poll for completion.
+
+        Job-level failure handling is not uniform across shipped
+        implementations, and this Protocol does not mandate one — check
+        the concrete destination's own docs/tests before assuming either
+        shape:
+
+        - The generic ``type: staged_upload`` destination
+          (``staged_upload.py``) catches any exception raised during
+          upload/trigger/poll and returns it as a failed ``SyncResult``
+          (``failed=<count>``, ``errors=[...]``) rather than raising.
+        - ``SalesforceBulkDestination`` (``salesforce_bulk.py``) raises
+          ``RuntimeError`` directly on auth failure, job-creation failure,
+          upload failure, or job-close failure — none of those become a
+          ``SyncResult``.
+
+        Raises:
+            Exception: see above — some implementations raise on
+                job-level failure, others convert it to a failed
+                ``SyncResult`` instead.
+        """
         ...
 
 
@@ -187,6 +231,13 @@ class OrphanCleanup(Protocol):
 
         Returns a tuple of `(dropped, failed)` where each is a list of
         schema-qualified table names. Implementations MUST only drop
-        tables that are known safe (e.g. end with "__drt_swap").
+        tables that are known safe (e.g. end with "__drt_swap"). A single
+        table's drop failure goes into `failed`, not raised — like
+        `list_orphan_swap_tables`, only a catalog/connection-level failure
+        that prevents attempting any drop at all should raise.
+
+        Raises:
+            Exception: If the destination cannot connect to attempt the
+                drops at all.
         """
         ...
