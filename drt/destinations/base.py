@@ -241,3 +241,46 @@ class OrphanCleanup(Protocol):
                 drops at all.
         """
         ...
+
+
+@runtime_checkable
+class QueryableDestination(Protocol):
+    """Optional destination capability backing ``drt test``'s per-sync
+    validation queries (#469). A new, separate Protocol rather than an
+    addition to ``Destination`` itself — per ADR 0007, adding a required
+    method to an already-shipped Protocol breaks every existing
+    implementer, so new capability goes here instead.
+
+    Replaces the old ``_QUERYABLE_TYPES`` config-class isinstance tuple that
+    ``drt/destinations/query.py``'s ``is_queryable``/``get_table_name``/
+    ``execute_test_query`` used to dispatch on: a new SQL destination gains
+    ``drt test`` support by implementing these two methods, with no edit to
+    ``query.py`` needed.
+
+    **Scope note:** this covers ``drt test`` only. ``drt run --dry-run
+    --diff``'s true-diff path (``drt/engine/diff.py``) and ``drt test
+    --store-failures`` need more than this Protocol provides — they also
+    call ``query.py``'s ``fetch_rows``/``fetch_rows_by_keys``/
+    ``fetch_failing_rows``, which remain separately, config-class-dispatched
+    (deliberately: their per-dialect coverage genuinely differs, e.g.
+    ClickHouse has no keyed fetch). A destination implementing only this
+    Protocol gets full ``drt test`` support but degrades gracefully — a
+    sample-mode diff / a "could not store failure sample" warning, neither
+    a crash — for those other two features, exactly as it did for any
+    destination outside the original four before this Protocol existed.
+    """
+
+    def get_table_name(self, config: DestinationConfig) -> str:
+        """Return the fully-qualified table name to run tests/diffs against.
+
+        Pure formatting of ``config`` — no I/O, never raises.
+        """
+        ...
+
+    def execute_test_query(self, config: DestinationConfig, query: str) -> int:
+        """Run ``query`` against the destination and return a single int.
+
+        Raises:
+            Exception: connection or query failure.
+        """
+        ...

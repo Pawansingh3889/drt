@@ -26,6 +26,70 @@ from drt.destinations.query import (
     is_queryable,
 )
 
+# ---------------------------------------------------------------------------
+# QueryableDestination — capability discovery (#469)
+#
+# is_queryable/get_table_name/execute_test_query dispatch on the destination
+# *instance* via QueryableDestination (isinstance check), not on the config
+# class via a hardcoded tuple. These tests exercise that dispatch directly on
+# the Protocol, separate from the config-based tests above/below which cover
+# the same functions through their public, unchanged signatures.
+# ---------------------------------------------------------------------------
+
+
+def test_queryable_destination_isinstance_all_four_sql_dialects() -> None:
+    from drt.destinations.base import QueryableDestination
+    from drt.destinations.clickhouse import ClickHouseDestination
+    from drt.destinations.mysql import MySQLDestination
+    from drt.destinations.postgres import PostgresDestination
+    from drt.destinations.snowflake import SnowflakeDestination
+
+    assert isinstance(PostgresDestination(), QueryableDestination)
+    assert isinstance(MySQLDestination(), QueryableDestination)
+    assert isinstance(ClickHouseDestination(), QueryableDestination)
+    assert isinstance(SnowflakeDestination(), QueryableDestination)
+
+
+def test_queryable_destination_isinstance_false_for_non_sql_destination() -> None:
+    from drt.destinations.base import QueryableDestination
+    from drt.destinations.slack import SlackDestination
+
+    assert not isinstance(SlackDestination(), QueryableDestination)
+
+
+def test_new_destination_becomes_queryable_without_touching_query_py() -> None:
+    """The architectural point of #469: implementing the two Protocol
+    methods is sufficient for is_queryable/get_table_name/execute_test_query
+    to pick a destination up — no change to query.py's dispatch code, unlike
+    the old ``_QUERYABLE_TYPES`` config-class tuple it replaced.
+    """
+    from drt.destinations.base import QueryableDestination
+
+    class _FakeQueryableDestination:
+        def get_table_name(self, config: Any) -> str:
+            return "fake_table"
+
+        def execute_test_query(self, config: Any, query: str) -> int:
+            return 7
+
+    dest = _FakeQueryableDestination()
+    assert isinstance(dest, QueryableDestination)
+    assert dest.get_table_name(None) == "fake_table"
+    assert dest.execute_test_query(None, "SELECT 1") == 7
+
+
+def test_queryable_destination_requires_both_methods() -> None:
+    """Structural typing: implementing only one of the two methods does not
+    satisfy the Protocol — a half-implemented destination is correctly
+    treated as not queryable rather than crashing on the missing method."""
+    from drt.destinations.base import QueryableDestination
+
+    class _OnlyGetTableName:
+        def get_table_name(self, config: Any) -> str:
+            return "t"
+
+    assert not isinstance(_OnlyGetTableName(), QueryableDestination)
+
 
 def _has_psycopg2() -> bool:
     try:
@@ -75,6 +139,94 @@ def test_get_table_name_postgres() -> None:
         upsert_key=["id"],
     )
     assert get_table_name(config) == "public.users"
+
+
+def test_execute_test_query_postgres_returns_int() -> None:
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (42,)
+    conn = _plain_conn(cursor)
+
+    config = PostgresDestinationConfig(
+        type="postgres",
+        host="localhost",
+        dbname="test",
+        table="public.users",
+        upsert_key=["id"],
+    )
+    with patch(
+        "drt.destinations.postgres.PostgresDestination._connect", return_value=conn
+    ):
+        result = execute_test_query(config, "SELECT COUNT(*) FROM t")
+
+    assert result == 42
+    cursor.execute.assert_called_once_with("SELECT COUNT(*) FROM t")
+    conn.close.assert_called_once()
+
+
+def test_mysql_is_queryable_and_table_name() -> None:
+    config = MySQLDestinationConfig(
+        type="mysql", host="localhost", dbname="test", table="users", upsert_key=["id"]
+    )
+    assert is_queryable(config) is True
+    assert get_table_name(config) == "users"
+
+
+def test_execute_test_query_mysql_tuple_row() -> None:
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (7,)
+    conn = _plain_conn(cursor)
+
+    config = MySQLDestinationConfig(
+        type="mysql", host="localhost", dbname="test", table="users", upsert_key=["id"]
+    )
+    with patch("drt.destinations.mysql.MySQLDestination._connect", return_value=conn):
+        result = execute_test_query(config, "SELECT COUNT(*) FROM t")
+
+    assert result == 7
+    cursor.execute.assert_called_once_with("SELECT COUNT(*) FROM t")
+    conn.close.assert_called_once()
+
+
+def test_execute_test_query_mysql_dict_cursor_row() -> None:
+    """pymysql's DictCursor yields a mapping, not a positional tuple."""
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"COUNT(*)": 9}
+    conn = _plain_conn(cursor)
+
+    config = MySQLDestinationConfig(
+        type="mysql", host="localhost", dbname="test", table="users", upsert_key=["id"]
+    )
+    with patch("drt.destinations.mysql.MySQLDestination._connect", return_value=conn):
+        result = execute_test_query(config, "SELECT COUNT(*) FROM t")
+
+    assert result == 9
+
+
+def test_clickhouse_is_queryable_and_table_name() -> None:
+    config = ClickHouseDestinationConfig(
+        type="clickhouse", host="localhost", database="test", table="users", upsert_key=["id"]
+    )
+    assert is_queryable(config) is True
+    assert get_table_name(config) == "users"
+
+
+def test_execute_test_query_clickhouse_returns_int() -> None:
+    client = MagicMock()
+    result_obj = MagicMock()
+    result_obj.result_rows = [(3,)]
+    client.query.return_value = result_obj
+
+    config = ClickHouseDestinationConfig(
+        type="clickhouse", host="localhost", database="test", table="users", upsert_key=["id"]
+    )
+    with patch(
+        "drt.destinations.clickhouse.ClickHouseDestination._connect", return_value=client
+    ):
+        result = execute_test_query(config, "SELECT COUNT(*) FROM t")
+
+    assert result == 3
+    client.query.assert_called_once_with("SELECT COUNT(*) FROM t")
+    client.close.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
