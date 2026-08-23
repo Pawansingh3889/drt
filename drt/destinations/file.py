@@ -34,6 +34,14 @@ from drt.destinations.base import SyncResult
 class FileDestination:
     """Write records to a CSV, JSON, or JSONL file."""
 
+    def __init__(self) -> None:
+        # The engine constructs one destination per sync and calls load() on that
+        # same instance for every batch. Keep write state instance-local so the
+        # first batch truncates a previous run's file while later batches append.
+        self._csv_columns: dict[str, tuple[str, ...]] = {}
+        self._json_records: dict[str, list[dict[str, Any]]] = {}
+        self._jsonl_started_paths: set[str] = set()
+
     def load(
         self,
         records: list[dict[str, Any]],
@@ -63,21 +71,68 @@ class FileDestination:
 
         return result
 
-    @staticmethod
-    def _write_csv(path: str, records: list[dict[str, Any]]) -> None:
-        columns = list(records[0].keys())
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=columns)
-            writer.writeheader()
+    def finalize_sync(
+        self,
+        config: DestinationConfig,
+        sync_options: SyncOptions,
+    ) -> None:
+        """End-of-sync hook (duck-typed, see ``drt/engine/sync.py``): drop this
+        run's write-state bookkeeping.
+
+        A CLI/engine-driven sync gets a fresh ``FileDestination`` per run (via
+        ``get_destination()``), so this never fires mid-run in that path. It
+        matters for a library caller that reuses one instance across multiple
+        ``run_sync()`` calls (e.g. a loop, or a long-lived process) — without
+        this reset, the second run would append to or fold in the first run's
+        records instead of truncating, contradicting the "first batch of this
+        run replaces the file" contract ``load()`` documents (caught in Codex
+        review on PR #1006).
+        """
+        del config, sync_options
+        self._csv_columns.clear()
+        self._json_records.clear()
+        self._jsonl_started_paths.clear()
+
+    def _write_csv(self, path: str, records: list[dict[str, Any]]) -> None:
+        columns = self._csv_columns.get(path)
+        first_batch = columns is None
+        if columns is None:
+            columns = tuple(records[0].keys())
+
+        expected_columns = set(columns)
+        for index, record in enumerate(records):
+            actual_columns = set(record)
+            if actual_columns != expected_columns:
+                missing = sorted(expected_columns - actual_columns)
+                unexpected = sorted(actual_columns - expected_columns)
+                raise ValueError(
+                    f"CSV column mismatch for '{path}' at batch record {index}: "
+                    f"expected {list(columns)!r}; missing {missing!r}; "
+                    f"unexpected {unexpected!r}"
+                )
+
+        mode = "w" if first_batch else "a"
+        with open(path, mode, newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=columns, extrasaction="raise")
+            if first_batch:
+                writer.writeheader()
             writer.writerows(records)
+        if first_batch:
+            self._csv_columns[path] = columns
 
-    @staticmethod
-    def _write_json(path: str, records: list[dict[str, Any]]) -> None:
+    def _write_json(self, path: str, records: list[dict[str, Any]]) -> None:
+        # A single top-level JSON array cannot be extended with a plain append.
+        # Buffer this format's full sync in memory and rewrite the valid array on
+        # each batch. This deliberate memory tradeoff is specific to array JSON;
+        # CSV and JSONL remain streaming and retain only small bookkeeping state.
+        accumulated = [*self._json_records.get(path, []), *records]
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(records, f, indent=2, default=str)
+            json.dump(accumulated, f, indent=2, default=str)
+        self._json_records[path] = accumulated
 
-    @staticmethod
-    def _write_jsonl(path: str, records: list[dict[str, Any]]) -> None:
-        with open(path, "w", encoding="utf-8") as f:
+    def _write_jsonl(self, path: str, records: list[dict[str, Any]]) -> None:
+        mode = "a" if path in self._jsonl_started_paths else "w"
+        with open(path, mode, encoding="utf-8") as f:
             for record in records:
                 f.write(json.dumps(record, default=str) + "\n")
+        self._jsonl_started_paths.add(path)
