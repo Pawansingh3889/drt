@@ -102,3 +102,44 @@ the local buffered JSONL destination are much lower-latency than a remote wareho
 Use these results to locate CPU work in this workload, not as a universal model of production
 network latency. Like `make benchmark`, profiling is manual maintainer tooling and does not run in
 CI.
+
+## Profile real local network I/O
+
+Issue #1008's follow-up keeps the same four-field records, 100-row batch size, and 100 / 10,000 /
+100,000-row scenarios, but replaces the I/O-light endpoints with real local sockets:
+
+```bash
+make profile-real-io
+```
+
+- The source leg starts an ephemeral `postgres:16-alpine` container, seeds the largest scenario
+  once, and profiles the real `PostgresSource.extract()` server-side cursor over TCP. Its source
+  boundary includes database and TCP wait *and* psycopg2/Python row conversion because cProfile
+  cannot split those operations inside the driver. The scenario batch size is also the driver's
+  server-side cursor fetch size.
+- The destination leg starts a minimal HTTP server in a separate spawned process, sleeps there for
+  a controlled 0, 10, 50, or 200 ms before every response, and profiles the real
+  `RestApiDestination.load()` in batch mode. One untimed warm-up request runs before any profiled
+  scenario so import/first-connection cost doesn't land on whichever scenario happens to run
+  first. The known delay is reported as network wait; the rest of `load()` is a mixed I/O/CPU
+  aggregate because cProfile cannot split `httpx` transport wait from serialization and
+  destination CPU work — the 0 ms run is the closest this gets to an upper bound on CPU-only cost,
+  since it has no injected wait to separate out. The delay is a chosen fixed input—not a measured
+  vendor RTT and not a model of jitter, retries, rate limits, or remote service variance.
+
+The full run requires Docker and takes several minutes because the large 200 ms REST scenario
+makes 1,000 sequential requests. It is manual maintainer tooling and is not collected by pytest or
+CI. Select smaller portions with `--leg`, `--scenario`, and `--latency-ms`, for example:
+
+```bash
+python3 scripts/run_real_io_profiling.py --leg rest --scenario small --latency-ms 10
+```
+
+`make profile-real-io` installs the `dev` and `postgres` extras before running the experiment —
+`dev` for `testcontainers[postgres]` (the ephemeral container), `postgres` for `psycopg2-binary`
+(the driver) — so it works on a fresh checkout without a prior `make dev`. Artifacts are ignored
+JSON files under `benchmarks/profiles/`; their
+version-1 shape is documented by
+[`real-io-profile-result-schema.json`](real-io-profile-result-schema.json). Every artifact is
+validated before it is written. Buckets are non-overlapping and sum to 100%; the Postgres and REST
+mixed buckets are deliberately I/O-bearing connector aggregates, not pure syscall time.
