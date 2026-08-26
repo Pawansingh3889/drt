@@ -5,8 +5,12 @@ The CLI exposes recent entries via ``drt status --history``; the MCP server expo
 them as ``drt_get_history`` so AI agents can query past runs.
 
 Why JSONL per-sync:
-- POSIX ``O_APPEND`` makes single-line writes atomic across ``--threads`` workers,
-  no lock file needed.
+- POSIX ``O_APPEND`` makes a single-line write atomic against *other appends*:
+  two appends can never tear or interleave, with or without a lock. That is
+  not the same as safe against ``prune()``'s wholesale rewrite (#963): a
+  prune reading the file before an append lands and replacing it after would
+  silently drop that append, so both now take the same OS-level lock
+  (:mod:`drt.state._file_lock`) rather than relying on ``O_APPEND`` alone.
 - Per-sync files keep retention prune trivial (rewrite the file once it crosses
   the cutoff) and let ``drt status --history <sync_name>`` read just one file.
 - JSONL is grep/jq friendly without a database dependency.
@@ -23,6 +27,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+
+from drt.state._file_lock import DEFAULT_TIMEOUT_SECONDS, FileLockTimeout, cross_process_lock
 
 logger = logging.getLogger(__name__)
 
@@ -82,30 +88,59 @@ class LocalHistoryManager:
     Files live under ``<project_dir>/.drt/history/<sync_name>.jsonl``. All
     writes append a single JSON object per line. Reads return the most recent
     N entries (newest first).
+
+    Cross-process safety (#963): both ``append`` and ``prune`` take the same
+    OS-level file lock (:mod:`drt.state._file_lock`). ``append``'s own write
+    was already safe against *other appends* via POSIX ``O_APPEND``, but not
+    against ``prune``'s wholesale rewrite: an append landing between
+    prune's read and its replace would be silently dropped unless append
+    also holds the lock prune waits on. Matching ``HistoryStore``'s
+    best-effort contract, a lock timeout on either method is logged and
+    swallowed rather than raised.
     """
 
     _MAX_ERRORS_PER_ENTRY = 5
 
-    def __init__(self, project_dir: Path = Path(".")) -> None:
+    def __init__(
+        self,
+        project_dir: Path = Path("."),
+        *,
+        lock_timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
         self._dir = project_dir / ".drt" / "history"
-        self._lock = threading.Lock()  # protects prune's read-rewrite-write
+        self._lock_timeout = lock_timeout
+        self._lock = threading.Lock()  # serialises append/prune within one process
 
     def _file_for(self, sync_name: str) -> Path:
         return self._dir / f"{sync_name}.jsonl"
 
+    def _lock_path(self, sync_name: str) -> Path:
+        return self._dir / f"{sync_name}.jsonl.lock"
+
     def append(self, entry: HistoryEntry) -> None:
         """Append one entry. Best-effort — failures are logged at WARNING and
         never propagate (sync results must not depend on history persistence).
+
+        Takes the cross-process lock (#963) even though the write itself is
+        ``O_APPEND``-atomic on its own: without it, this write could still
+        land inside a concurrent ``prune()``'s read-rewrite-replace window
+        on another process and be silently discarded when that rewrite
+        completes.
         """
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
             # Truncate errors to bound disk growth on long-failing syncs.
             entry.errors = entry.errors[: self._MAX_ERRORS_PER_ENTRY]
             line = json.dumps(asdict(entry), default=str)
-            # POSIX O_APPEND makes single-line writes atomic across processes.
-            with self._file_for(entry.sync_name).open("a") as f:
-                f.write(line + "\n")
+            with self._lock:
+                with cross_process_lock(
+                    self._lock_path(entry.sync_name), timeout=self._lock_timeout
+                ):
+                    with self._file_for(entry.sync_name).open("a") as f:
+                        f.write(line + "\n")
         except OSError as exc:  # disk full, permission denied, etc.
+            logger.warning("history append failed for sync=%s: %s", entry.sync_name, exc)
+        except FileLockTimeout as exc:
             logger.warning("history append failed for sync=%s: %s", entry.sync_name, exc)
 
     def read(
@@ -139,8 +174,10 @@ class LocalHistoryManager:
         """Drop entries older than ``retention_days`` for one sync.
 
         Returns the number of entries removed. No-op if the file doesn't exist.
-        Rewrites the file in place under a process-local lock so concurrent
-        workers don't lose appends in the gap between read and write.
+        Rewrites the file in place under a process-local lock plus an
+        OS-level cross-process lock (#963) so a concurrent ``append`` from a
+        genuinely separate ``drt`` process (not just another thread) isn't
+        lost in the gap between this method's read and its replace.
         """
         path = self._file_for(sync_name)
         if not path.exists():
@@ -149,31 +186,42 @@ class LocalHistoryManager:
         cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
 
         with self._lock:
-            kept: list[HistoryEntry] = []
-            removed = 0
-            for entry in _read_jsonl(path):
-                try:
-                    started = datetime.fromisoformat(entry.started_at)
-                except ValueError:
-                    # Malformed timestamp — keep so a human can inspect.
-                    kept.append(entry)
-                    continue
-                if started < cutoff:
-                    removed += 1
-                else:
-                    kept.append(entry)
+            try:
+                with cross_process_lock(self._lock_path(sync_name), timeout=self._lock_timeout):
+                    kept: list[HistoryEntry] = []
+                    removed = 0
+                    for entry in _read_jsonl(path):
+                        try:
+                            started = datetime.fromisoformat(entry.started_at)
+                        except ValueError:
+                            # Malformed timestamp: keep so a human can inspect.
+                            kept.append(entry)
+                            continue
+                        if started < cutoff:
+                            removed += 1
+                        else:
+                            kept.append(entry)
 
-            if removed == 0:
+                    if removed == 0:
+                        return 0
+
+                    # Rewrite (entries are already in the order we want,
+                    # preserved from the original file).
+                    tmp = path.with_suffix(".jsonl.tmp")
+                    with tmp.open("w") as f:
+                        for entry in kept:
+                            f.write(json.dumps(asdict(entry), default=str) + "\n")
+                    tmp.replace(path)
+                    return removed
+            except FileLockTimeout:
+                # Best-effort, like HistoryStore.append: never fail the
+                # caller over a retention housekeeping pass.
+                logger.warning(
+                    "history prune failed for sync=%s: lock timed out after %ss",
+                    sync_name,
+                    self._lock_timeout,
+                )
                 return 0
-
-            # Rewrite (entries are already in the order we want — preserved
-            # from the original file).
-            tmp = path.with_suffix(".jsonl.tmp")
-            with tmp.open("w") as f:
-                for entry in kept:
-                    f.write(json.dumps(asdict(entry), default=str) + "\n")
-            tmp.replace(path)
-            return removed
 
 
 # Back-compat alias — see the note on ``StateManager`` in state/manager.py.

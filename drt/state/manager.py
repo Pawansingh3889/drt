@@ -11,6 +11,11 @@ Thread safety: ``drt run --threads N`` calls ``save_sync`` concurrently
 from each worker. Every method that touches state.json runs under a
 process-local :class:`threading.Lock` so the load-modify-save cycle is
 atomic and parallel writers don't clobber each other's updates.
+
+Cross-process safety: the same load-modify-save cycle is also wrapped in an
+OS-level file lock (:mod:`drt.state._file_lock`, #963), so a genuinely
+separate ``drt`` process (``drt run`` and ``drt retry``/``drt status`` are
+always separate processes, never threads) blocks instead of racing.
 """
 
 from __future__ import annotations
@@ -21,6 +26,9 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+
+from drt.state._file_lock import DEFAULT_TIMEOUT_SECONDS, FileLockTimeout, cross_process_lock
+from drt.state.errors import StateContentionError
 
 
 @dataclass
@@ -83,11 +91,25 @@ class LocalStateManager:
     serialises the load-modify-save cycle in :meth:`save_sync` and the
     read-only operations so a reader never observes a partially-written
     file in-memory either.
+
+    Cross-process safety (#963): :meth:`save_sync` and :meth:`reset` also
+    hold an OS-level file lock for the same critical section, so a second
+    ``drt`` process blocks instead of racing the first one's read-modify-write.
+    Exhausting the lock's timeout raises ``StateContentionError``, matching
+    ``StateStore``'s Protocol contract. ``get_last_sync``/``get_all`` stay
+    ``threading.Lock``-only since they never write.
     """
 
-    def __init__(self, project_dir: Path = Path(".")) -> None:
+    def __init__(
+        self,
+        project_dir: Path = Path("."),
+        *,
+        lock_timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
         self._state_dir = project_dir / ".drt"
         self._state_file = self._state_dir / "state.json"
+        self._lock_file = self._state_dir / "state.json.lock"
+        self._lock_timeout = lock_timeout
         self._lock = threading.Lock()
 
     def _load_all(self) -> dict[str, Any]:
@@ -126,9 +148,16 @@ class LocalStateManager:
 
     def save_sync(self, state: SyncState) -> None:
         with self._lock:
-            data = self._load_all()
-            data[state.sync_name] = asdict(state)
-            self._save_all(data)
+            try:
+                with cross_process_lock(self._lock_file, timeout=self._lock_timeout):
+                    data = self._load_all()
+                    data[state.sync_name] = asdict(state)
+                    self._save_all(data)
+            except FileLockTimeout as exc:
+                raise StateContentionError(
+                    f"state update for '{state.sync_name}' could not acquire the "
+                    f"cross-process lock within {self._lock_timeout}s"
+                ) from exc
 
     def reset(self, sync_name: str) -> bool:
         """Drop the recorded run state for ``sync_name`` (#776).
@@ -145,15 +174,22 @@ class LocalStateManager:
 
         Takes the same lock as ``save_sync``: ``drt run --threads`` writes
         state concurrently, and a read-modify-write here would otherwise race
-        a run finishing.
+        a run finishing. Also takes the same cross-process file lock (#963).
         """
         with self._lock:
-            data = self._load_all()
-            if sync_name not in data:
-                return False  # never run — nothing to clear, and no file to create
-            del data[sync_name]
-            self._save_all(data)
-            return True
+            try:
+                with cross_process_lock(self._lock_file, timeout=self._lock_timeout):
+                    data = self._load_all()
+                    if sync_name not in data:
+                        return False  # never run: nothing to clear, no file to create
+                    del data[sync_name]
+                    self._save_all(data)
+                    return True
+            except FileLockTimeout as exc:
+                raise StateContentionError(
+                    f"state reset for '{sync_name}' could not acquire the "
+                    f"cross-process lock within {self._lock_timeout}s"
+                ) from exc
 
     def now(self) -> str:
         return datetime.now(timezone.utc).isoformat()

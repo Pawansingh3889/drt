@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from drt.state._file_lock import DEFAULT_TIMEOUT_SECONDS, cross_process_lock
+
 
 @dataclass
 class DeadLetter:
@@ -110,7 +112,8 @@ class DlqBackend(Protocol):
         ``HistoryStore.append`` — a failure is logged at WARNING and
         swallowed rather than raised, so a DLQ persistence problem never
         fails the sync whose records it's recording. ``LocalDlqStore`` does
-        not catch local I/O errors (disk full, permission denied); those
+        not catch local I/O errors (disk full, permission denied) or the
+        cross-process lock timing out (#963, ``FileLockTimeout``); those
         still propagate.
         """
         ...
@@ -143,22 +146,34 @@ class DlqBackend(Protocol):
 class LocalDlqStore:
     """Append / read / replace dead-letter entries under ``.drt/dlq/``.
 
-    One JSONL file per sync (``<sync_name>.jsonl``). All mutating methods run
-    under ``self._lock``, a **process-local** ``threading.Lock`` — it
-    serialises ``drt run --threads N`` workers within a single process, but
-    does **not** coordinate across processes: a concurrent ``drt run`` and
-    ``drt retry`` doing read-modify-write on the same file is last-writer-wins.
-    Single-writer-at-a-time is the expected operational model.
+    One JSONL file per sync (``<sync_name>.jsonl``). Every mutating method
+    (``append``/``replace``/``reconcile``) runs under two locks: ``self._lock``,
+    a process-local ``threading.Lock`` serialising ``drt run --threads N``
+    workers within one process, and a per-file OS-level lock (#963,
+    :mod:`drt.state._file_lock`), so a genuinely separate process (``drt run``
+    and ``drt retry`` are always separate processes, never threads) blocks
+    instead of racing the same read-modify-write cycle. ``read``/``depth``/
+    ``all_depths`` stay unlocked, as before: they can still observe a write
+    in flight (this closes writer-vs-writer loss, not torn reads).
     """
 
-    def __init__(self, project_dir: Path = Path(".")) -> None:
+    def __init__(
+        self,
+        project_dir: Path = Path("."),
+        *,
+        lock_timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
         self._dlq_dir = project_dir / ".drt" / "dlq"
+        self._lock_timeout = lock_timeout
         self._lock = threading.Lock()
 
     # -- path helpers -------------------------------------------------------
 
     def _path(self, sync_name: str) -> Path:
         return self._dlq_dir / f"{sync_name}.jsonl"
+
+    def _lock_path(self, sync_name: str) -> Path:
+        return self._dlq_dir / f"{sync_name}.jsonl.lock"
 
     @staticmethod
     def _count_lines(path: Path) -> int:
@@ -191,30 +206,36 @@ class LocalDlqStore:
         with self._lock:
             path = self._path(sync_name)
             path.parent.mkdir(parents=True, exist_ok=True)
-            lines = self._read_raw(path)
-            lines.extend(json.dumps(asdict(e)) for e in entries)
-            if max_records > 0 and len(lines) > max_records:
-                lines = lines[-max_records:]
-            path.write_text("\n".join(lines) + "\n")
-            return len(lines)
+            with cross_process_lock(self._lock_path(sync_name), timeout=self._lock_timeout):
+                lines = self._read_raw(path)
+                lines.extend(json.dumps(asdict(e)) for e in entries)
+                if max_records > 0 and len(lines) > max_records:
+                    lines = lines[-max_records:]
+                path.write_text("\n".join(lines) + "\n")
+                return len(lines)
 
     def replace(self, sync_name: str, entries: list[DeadLetter]) -> None:
         """Overwrite the queue with ``entries`` (empty list removes the file).
 
-        Wholesale — ``entries`` fully replaces whatever is on disk, including
+        Wholesale: ``entries`` fully replaces whatever is on disk, including
         anything a concurrent writer appended since this call's caller last
         read the queue (#955). ``drt retry`` uses ``reconcile()`` instead,
         which re-reads fresh state and touches only named entries; this
         method still backs ``clear()`` (discard everything, intentionally)
         and stays available for callers that genuinely want a full overwrite.
+        The cross-process lock (#963) only stops this write from landing
+        mid-write of a concurrent ``append``/``reconcile``. It can't stop
+        the overwrite itself from discarding entries this call never saw,
+        which is the documented, intentional "wholesale" contract above.
         """
         with self._lock:
             path = self._path(sync_name)
-            if not entries:
-                path.unlink(missing_ok=True)
-                return
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("\n".join(json.dumps(asdict(e)) for e in entries) + "\n")
+            with cross_process_lock(self._lock_path(sync_name), timeout=self._lock_timeout):
+                if not entries:
+                    path.unlink(missing_ok=True)
+                    return
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("\n".join(json.dumps(asdict(e)) for e in entries) + "\n")
 
     def clear(self, sync_name: str) -> None:
         """Remove the queue file for ``sync_name`` if it exists.
@@ -252,44 +273,39 @@ class LocalDlqStore:
     ) -> list[DeadLetter]:
         """Remove/update entries by identity against a fresh read (#955).
 
-        See the ``DlqBackend`` Protocol docstring for the "why" — the short
+        See the ``DlqBackend`` Protocol docstring for the "why": the short
         version is this is what ``drt retry`` uses instead of ``replace()``
         so a concurrent append isn't silently overwritten.
 
-        ``self._lock`` is process-local (same caveat as the class docstring
-        above), and this class has no OS-level file lock or conditional
-        write — unlike ``ObjectStoreDlqBackend.reconcile()``, which is
-        genuinely safe against a concurrent writer because generation/ETag
-        preconditioning catches a stale write and forces a retry against
-        fresh state. Here, a separate ``drt run`` **process** appending
-        between this method's read and its write still loses that append
-        exactly as ``replace()`` did (caught in review, #962) — this class
-        was never cross-process-safe (see the docstring above) and this
-        method does not change that. What it *does* fix, on local too: the
-        legacy bug of computing a result from a stale in-memory snapshot
-        (``untouched + remaining``) rather than from a fresh read, and
-        reconciling by identity rather than position — both matter the
-        moment real file locking lands, since a wholesale-overwrite
-        operation could never be made cross-process-safe no matter how it's
-        locked. Real cross-process safety needs OS-level file locking,
-        which no local state store has today; tracked as a follow-up
-        (#963) covering ``LocalStateManager``/``LocalHistoryManager`` too,
-        not just this class.
+        Cross-process-safe as of #963: the OS-level lock this method now
+        holds (see the class docstring) means a separate ``drt run``
+        process's ``append()`` either completes fully before this method's
+        read, or waits for this method to finish before it starts. There
+        is no window left where an append lands between the read and the
+        write and gets silently discarded. Before #963, ``self._lock``
+        alone (process-local) could not prevent that; #955/#962 only fixed
+        this method's own read-then-compute-then-write logic (reconciling
+        by identity against a fresh read rather than a stale in-memory
+        snapshot), which is necessary but was not sufficient without this
+        method also serialising against a genuinely separate process.
         """
         updates = updates or {}
         remove_ids = set(remove_ids)
         with self._lock:
             path = self._path(sync_name)
-            current = self._read_entries(sync_name)
-            result = [
-                updates.get(entry.id, entry) for entry in current if entry.id not in remove_ids
-            ]
-            if not result:
-                path.unlink(missing_ok=True)
-            else:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("\n".join(json.dumps(asdict(e)) for e in result) + "\n")
-            return result
+            with cross_process_lock(self._lock_path(sync_name), timeout=self._lock_timeout):
+                current = self._read_entries(sync_name)
+                result = [
+                    updates.get(entry.id, entry)
+                    for entry in current
+                    if entry.id not in remove_ids
+                ]
+                if not result:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("\n".join(json.dumps(asdict(e)) for e in result) + "\n")
+                return result
 
     def depth(self, sync_name: str) -> int:
         """Return the number of entries queued for ``sync_name``."""
