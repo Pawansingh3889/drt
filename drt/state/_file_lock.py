@@ -91,7 +91,9 @@ def cross_process_lock(
         FileLockTimeout: see the exception's docstring.
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    # Owner-only, matching the rest of .drt/ (credentials hardened to 0o600
+    # in #650) rather than the world-readable 0o644 CodeQL flags by default.
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     try:
         deadline = time.monotonic() + timeout
         while not _try_lock(fd):
